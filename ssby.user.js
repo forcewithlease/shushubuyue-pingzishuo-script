@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         桃趣乐友叔叔不约小助手
 // @namespace    https://www.shushubuyue.net/
-// @version      2.4
+// @version      2.8
 // @description  桃趣乐友叔叔不约小助手，关注“桃趣乐友”公众号享受最新版本。
 // @author       桃趣乐友
 // @match        *://shushubuyue.net/*
@@ -17,11 +17,676 @@
 // @include      *://pingzishuo.com/*
 // @include      *://*.pingzishuo.com/*
 // @grant        none
+// @run-at       document-start
+// @inject-into  page
 // @license      Apache License 2.0
 // ==/UserScript==
 
 (function() {
     'use strict';
+
+    // SocketBridge：通过 WebSocket 接口层加速切换与读取对方信息，接口不可用时回退 DOM 逻辑。
+    const SocketBridge = (function () {
+        'use strict';
+
+        // 常量
+        const ENGINE_MESSAGE = '4';        // Engine.IO message 帧前缀
+        const FRAME_EVENT = '2';           // Socket.IO EVENT
+        const FRAME_ACK = '3';             // Socket.IO ACK
+        const MIN_REMATCH_DELAY_MS = 500;  // 结束确认后、重发 new 前的最小间隔
+        const END_ACK_TIMEOUT_MS = 3000;   // 结束回执超时，超时回退 DOM
+        const PARTNER_CACHE_TTL_MS = 8000;    // 搭档资料有效期，防跨会话串场
+        const PARTNER_PROFILE_TTL_MS = 60000; // 人机特征有效期，比搭档资料长，防漏判
+
+        const deps = {
+            isOn: function () { return false; }, // 主循环是否开启
+            fallbackLeave: null,                 // 纯 DOM 离开函数
+            onRawFrame: null                     // 非 syscmd 事件帧 / 二进制帧交给外部处理
+        };
+
+        let bridgeInstalled = false; // 是否已成功钩住 WebSocket
+        let bridgeVerified = false;  // 是否解析到过业务帧
+        let socketOpen = false;
+        let socketCurrent = null;
+        let socketPacketId = 0;      // 自建 ackId 自增计数
+        let socketNewPayload = null; // 捕获的 new 载荷
+        let partnerCache = null;     // { chatId, gender, ts }
+        let partnerProfile = null;   // { chatId, wordFilter, labels, hasWeixinKey, ts }
+        let socketFlowOwned = false;
+        let socketMatchInProgress = false;
+        let socketEndPending = false;
+        let socketEndPacketId = null;
+        let socketHandledChatId = null;
+        let endTimeoutTimer = null;
+        let lastConnectedAt = 0; // 最近一次配对成功（connected）的时间戳
+
+        function socketDisabled() {
+            try { return localStorage.getItem('ssby_socket_disabled') === 'true'; }
+            catch (e) { return false; }
+        }
+
+        function parseSocketIoPacket(data) {
+            if (typeof data !== 'string') return null;
+            let packet = data;
+            if (packet.charAt(0) === ENGINE_MESSAGE) packet = packet.slice(1);
+            const type = packet.charAt(0);
+            if (type !== FRAME_EVENT && type !== FRAME_ACK) return null;
+            packet = packet.slice(1);
+            const idx = packet.indexOf('[');
+            if (idx < 0) return null;
+            const idText = packet.slice(0, idx);
+            try {
+                const payload = JSON.parse(packet.slice(idx));
+                if (!Array.isArray(payload)) return null;
+                if (type === FRAME_EVENT && typeof payload[0] !== 'string') return null;
+                return {
+                    type: type === FRAME_EVENT ? 'event' : 'ack',
+                    event: payload[0],
+                    args: payload.slice(1),
+                    packetId: /^\d+$/.test(idText) ? Number(idText) : null
+                };
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function isOpen() { return socketOpen && !!socketCurrent; }
+
+        function sendEvent(event, payload, requestAck) {
+            if (!isOpen()) return false;
+            const id = requestAck ? ++socketPacketId : null;
+            const frame = ENGINE_MESSAGE + FRAME_EVENT +
+                (id === null ? '' : String(id)) +
+                JSON.stringify([event, payload]);
+            try { socketCurrent.send(frame); return true; }
+            catch (e) { return false; }
+        }
+
+        function sendEnd(chatId) {
+            if (!chatId || !isOpen()) return false;
+            const id = ++socketPacketId;
+            const frame = ENGINE_MESSAGE + FRAME_EVENT + String(id) +
+                JSON.stringify(['syscmd', { msg: 'end', chatId: chatId, countTalked: true }]);
+            try { socketCurrent.send(frame); socketEndPacketId = id; return true; }
+            catch (e) { return false; }
+        }
+
+        function parsePartner(command) {
+            const info = command && typeof command === 'object' ? command : {};
+            const pInfo = info.partnerInfoObj && typeof info.partnerInfoObj === 'object'
+                ? info.partnerInfoObj : {};
+            const gRaw = pInfo.strGender != null ? pInfo.strGender : info.strGender;
+            const chatId = typeof info.chatId === 'string' ? info.chatId : '';
+            const g = String(gRaw == null ? '' : gRaw).trim().toLowerCase();
+            let gender = '';
+            if (g === 'm' || g.indexOf('男') >= 0) gender = '男';
+            else if (g === 'f' || g.indexOf('女') >= 0) gender = '女';
+            if (!gender || !chatId) return null;
+            return { gender: gender, chatId: chatId };
+        }
+
+        // 提取 connected 帧里的人机特征，判定逻辑交给外部
+        function parseBotSignals(command) {
+            const info = command && typeof command === 'object' ? command : {};
+            const pInfo = info.partnerInfoObj && typeof info.partnerInfoObj === 'object'
+                ? info.partnerInfoObj : {};
+            const wf = pInfo.wordFilter;
+            return {
+                wordFilter: typeof wf === 'number' ? wf : null,
+                labels: Array.isArray(info.labels) ? info.labels : [],
+                hasWeixinKey: !!(info.extra && typeof info.extra === 'object' &&
+                    Object.prototype.hasOwnProperty.call(info.extra, 'isWeixin'))
+            };
+        }
+
+        function onEndAck() {
+            if (!socketEndPending) return;
+            socketEndPending = false;
+            socketEndPacketId = null;
+            if (endTimeoutTimer) { clearTimeout(endTimeoutTimer); endTimeoutTimer = null; }
+            if (!socketNewPayload) {
+                console.log('[SSBY] 接口结束已确认，但未捕获 new 载荷，回退 DOM');
+                if (deps.fallbackLeave) deps.fallbackLeave();
+                return;
+            }
+            setTimeout(function () {
+                if (!isActive()) {
+                    console.log('[SSBY] 重发 new 前接口已失效，回退 DOM');
+                    if (deps.fallbackLeave) deps.fallbackLeave();
+                    return;
+                }
+                const payload = socketNewPayload;
+                socketMatchInProgress = true;
+                socketHandledChatId = null;
+                partnerCache = null;
+                if (!sendEvent('syscmd', payload, false)) {
+                    console.log('[SSBY] 重发 new 失败，回退 DOM');
+                    if (deps.fallbackLeave) deps.fallbackLeave();
+                } else {
+                    console.log('[SSBY] 接口已发起重新匹配');
+                }
+            }, MIN_REMATCH_DELAY_MS);
+        }
+
+        function onMessage(data) {
+            if (typeof data !== 'string') {
+                if (deps.onRawFrame) deps.onRawFrame(null, data, 'in');
+                return;
+            }
+            const pkt = parseSocketIoPacket(data);
+            if (!pkt) return;
+            if (pkt.type === 'ack') {
+                if (pkt.packetId === socketEndPacketId) onEndAck();
+                return;
+            }
+            if (pkt.event !== 'syscmd') {
+                if (deps.onRawFrame) deps.onRawFrame(pkt, null, 'in');
+                return;
+            }
+            const cmd = pkt.args[0];
+            const msg = typeof cmd === 'string' ? cmd : (cmd && cmd.msg);
+            if (!msg) return;
+            if (!bridgeVerified) {
+                bridgeVerified = true;
+                console.log('[SSBY] Socket Bridge 已识别业务帧，接口加速启用');
+            }
+            if (msg === 'connected') {
+                socketMatchInProgress = false;
+                lastConnectedAt = Date.now();
+                const partner = parsePartner(cmd);
+                const signal = parseBotSignals(cmd);
+                partnerProfile = {
+                    chatId: partner ? partner.chatId
+                        : (typeof cmd.chatId === 'string' ? cmd.chatId : ''),
+                    wordFilter: signal.wordFilter,
+                    labels: signal.labels,
+                    hasWeixinKey: signal.hasWeixinKey,
+                    ts: Date.now()
+                };
+                if (partner) {
+                    partnerCache = { chatId: partner.chatId, gender: partner.gender, ts: Date.now() };
+                    socketHandledChatId = partner.chatId;
+                }
+            } else if (msg === 'end' || msg === 'endByPartner') {
+                // 服务端以 event 帧形式回执结束（部分实现无独立 ack）
+                if (socketEndPending) onEndAck();
+            }
+        }
+
+        function install() {
+            if (bridgeInstalled) return;
+            const proto = window.WebSocket && window.WebSocket.prototype;
+            if (!proto) { bridgeInstalled = true; return; }
+            if (proto.__ssbyBridgeInstalled) { bridgeInstalled = true; return; }
+            const nativeSend = proto.send;
+            const nativeAdd = proto.addEventListener;
+            const tracked = new WeakSet();
+
+            function track(sock) {
+                if (tracked.has(sock)) return;
+                tracked.add(sock);
+                socketCurrent = sock;
+                socketOpen = true;
+                nativeAdd.call(sock, 'open', function () {
+                    if (socketCurrent === sock) socketOpen = true;
+                });
+                nativeAdd.call(sock, 'message', function (e) { onMessage(e.data); });
+                nativeAdd.call(sock, 'close', function () {
+                    if (socketCurrent !== sock) return;
+                    socketOpen = false;
+                    socketFlowOwned = false;
+                    socketMatchInProgress = false;
+                    if (socketEndPending) {
+                        socketEndPending = false;
+                        socketEndPacketId = null;
+                        console.log('[SSBY] Socket 断开且等待结束确认，回退 DOM');
+                        if (deps.fallbackLeave) deps.fallbackLeave();
+                    } else {
+                        console.log('[SSBY] Socket 连接已断开，回退 DOM 检测');
+                    }
+                });
+            }
+
+            proto.send = function (data) {
+                track(this);
+                if (typeof data !== 'string') {
+                    if (deps.onRawFrame) deps.onRawFrame(null, data, 'out');
+                    return nativeSend.call(this, data);
+                }
+                const pkt = parseSocketIoPacket(data);
+                if (pkt && pkt.packetId != null) {
+                    socketPacketId = Math.max(socketPacketId, pkt.packetId);
+                }
+                if (pkt && pkt.type === 'event' && pkt.event === 'syscmd') {
+                    const cmd = pkt.args[0];
+                    const m = typeof cmd === 'string' ? cmd : (cmd && cmd.msg);
+                    if (m === 'new') {
+                        socketNewPayload = JSON.parse(JSON.stringify(cmd));
+                        socketMatchInProgress = true;
+                        socketFlowOwned = true;
+                        socketEndPending = false;
+                        socketHandledChatId = null;
+                        partnerCache = null;
+                        console.log('[SSBY] 已捕获 new 载荷，准备接口加速');
+                    }
+                } else if (pkt) {
+                    if (deps.onRawFrame) deps.onRawFrame(pkt, null, 'out');
+                }
+                return nativeSend.call(this, data);
+            };
+            try {
+                Object.defineProperty(proto, '__ssbyBridgeInstalled', {
+                    configurable: false, enumerable: false, value: true, writable: false
+                });
+            } catch (e) { /* 某些引擎 defineProperty 受限，忽略 */ }
+            bridgeInstalled = true;
+        }
+
+        function isActive() {
+            return bridgeInstalled && bridgeVerified && !socketDisabled() && deps.isOn();
+        }
+
+        function takePartner() {
+            if (!isActive()) return null;
+            if (!partnerCache) return null;
+            if (Date.now() - partnerCache.ts > PARTNER_CACHE_TTL_MS) {
+                partnerCache = null;
+                return null;
+            }
+            return partnerCache;
+        }
+
+        function consumePartner() {
+            partnerCache = null;
+            partnerProfile = null;
+            socketHandledChatId = null;
+        }
+
+        function endAndRematch() {
+            if (!isActive()) return false;
+            if (!isOpen()) return false;
+            const chatId = socketHandledChatId || (partnerCache && partnerCache.chatId);
+            if (!chatId) return false;
+            if (!sendEnd(chatId)) return false;
+            socketFlowOwned = true;
+            socketEndPending = true;
+            consumePartner();
+            if (endTimeoutTimer) clearTimeout(endTimeoutTimer);
+            endTimeoutTimer = setTimeout(function () {
+                endTimeoutTimer = null;
+                if (!socketEndPending) return;
+                socketEndPending = false;
+                socketEndPacketId = null;
+                console.log('[SSBY] 接口结束未收到确认，回退 DOM 离开');
+                if (deps.fallbackLeave) deps.fallbackLeave();
+            }, END_ACK_TIMEOUT_MS);
+            return true;
+        }
+
+        function reset() {
+            socketFlowOwned = false;
+            socketMatchInProgress = false;
+            socketEndPending = false;
+            socketEndPacketId = null;
+            socketHandledChatId = null;
+            partnerCache = null;
+            partnerProfile = null;
+            lastConnectedAt = 0;
+            if (endTimeoutTimer) { clearTimeout(endTimeoutTimer); endTimeoutTimer = null; }
+        }
+
+        function bind(d) {
+            if (d) Object.assign(deps, d);
+        }
+
+        return {
+            install: install,
+            isActive: isActive,
+            takePartner: takePartner,
+            // 读取人机特征，不消费
+            getPartnerProfile: function () {
+                if (!isActive() || !partnerProfile) return null;
+                if (Date.now() - partnerProfile.ts > PARTNER_PROFILE_TTL_MS) {
+                    partnerProfile = null;
+                    return null;
+                }
+                return partnerProfile;
+            },
+            endAndRematch: endAndRematch,
+            consumePartner: consumePartner,
+            reset: reset,
+            bind: bind,
+            getConnectedAt: function () { return lastConnectedAt; }
+        };
+    })();
+    SocketBridge.install();
+    console.log('[SSBY] 接口桥已安装，等待业务帧以启用加速');
+
+    // ============ 图片抢存 ============
+    // WS 帧到达瞬间抓图，把聊天框里临时签名地址换成本地 Blob URL
+    const ImageVault = (function () {
+        'use strict';
+
+        const MAX_ITEMS = 30;       // 最多缓存的张数，超出按最旧的淘汰
+        const APPLY_WINDOW = 10000; // 新存的图在 10 秒内持续尝试替换 DOM
+
+        // 提取用（带 g，仅用于 match）
+        const URL_G = /https?:\/\/[^\s"'\\<>,;)\]]+/gi;
+        // 判定用（不带 g，避免 lastIndex 串味）
+        const IMG_EXT = /\.(?:jpe?g|png|gif|webp|bmp|avif)(?:\?|#|$)/i;
+
+        const store = new Map();   // 原图 URL -> { blob, objectUrl, ts }
+        const inflight = new Set(); // 已发起、尚未落库的 URL
+        let enabled = true;
+        try { enabled = localStorage.getItem('ssby_img_vault') !== 'false'; } catch (e) {}
+
+        // 抓包模式：true 时记录每一帧，默认只记每种事件的第一帧
+        let probe = false;
+        try { probe = localStorage.getItem('ssby_probe') === 'true'; } catch (e) {}
+
+        const eventHits = new Map(); // 协议探针：事件名 -> 已记录次数
+        const logBuf = [];           // 日志缓冲，供 __ssbyImgLog() 一次性导出
+        let observer = null;
+        let scheduled = false;
+        let lastStaleScan = 0;       // 陈旧图（存库超 10 秒）上次全量扫描时间，用于低频兜底
+
+        // 日志脱敏：URL 只保留主机，路径打码，避免日志暴露图片地址
+        function maskUrl(s) {
+            return String(s).replace(
+                /((?:https?:\/\/)?[\w.-]+\.[a-z]{2,})\/[^\s"'<>]+/gi,
+                '$1/***'
+            );
+        }
+
+        function log() {
+            let line;
+            try {
+                const ts = new Date().toTimeString().slice(0, 8);
+                line = '[SSBY][图][' + ts + '] ' + Array.prototype.slice.call(arguments).join(' ');
+                line = maskUrl(line);
+            }
+            catch (e) { return; }
+            logBuf.push(line);
+            if (logBuf.length > 800) logBuf.shift();
+            try { console.log(line); } catch (e) {}
+        }
+
+        // 站方图床目录（域名可变），/chatImage/ 下即使无扩展名也按图片处理
+        const IMG_PATH = /^https?:\/\/[^\/\s]+\/chatImage\//i;
+
+        // 裸域名 URL（content 无协议头）：/chatImage/ 目录 或 任意域名的图片扩展名
+        const BARE_IMG_RE =
+            /(?:[\w.-]+\/chatImage\/[^\s"'\\<>,;)\]]+|(?:[\w-]+\.)+[a-z]{2,}\/[^\s"'\\<>,;)\]]+\.(?:jpe?g|png|gif|webp|bmp|avif)(?:[?#][^\s"'\\<>,;)\]]*)?)/i;
+
+        // 把裸域名 URL 补成完整地址（DOM 里的 <img> 用的是带协议的完整地址，key 必须跟它对上）
+        function normalizeUrl(u) {
+            if (typeof u === 'string' && u.indexOf('http') !== 0 && BARE_IMG_RE.test(u)) {
+                return 'https://' + u.match(BARE_IMG_RE)[0];
+            }
+            return u;
+        }
+
+        function isImageUrl(u) {
+            if (typeof u !== 'string' || u.indexOf('http') !== 0) return false;
+            return IMG_EXT.test(u) || IMG_PATH.test(u);
+        }
+
+        // 递归翻载荷，把所有像图片的 URL 捞出来。不依赖具体字段名，协议变了也能用。
+        function extract(value, out, depth) {
+            if (!value || depth > 6) return;
+            if (typeof value === 'string') {
+                const hits = value.match(URL_G);
+                if (hits) {
+                    for (let i = 0; i < hits.length; i++) {
+                        if (IMG_EXT.test(hits[i])) out.push(hits[i]);
+                    }
+                }
+                // 图片 URL 可能省略协议头（strangerMessage 的 content 就是裸域名）
+                const bare = value.match(BARE_IMG_RE);
+                if (bare) {
+                    const norm = 'https://' + bare[0];
+                    if (out.indexOf(norm) < 0) out.push(norm);
+                }
+                return;
+            }
+            if (Array.isArray(value)) {
+                for (let i = 0; i < value.length; i++) extract(value[i], out, depth + 1);
+                return;
+            }
+            if (typeof value === 'object') {
+                for (const k in value) {
+                    if (Object.prototype.hasOwnProperty.call(value, k)) extract(value[k], out, depth + 1);
+                }
+            }
+        }
+
+        function save(url, blob) {
+            const old = store.get(url);
+            if (old) URL.revokeObjectURL(old.objectUrl);
+            const objectUrl = URL.createObjectURL(blob);
+            store.set(url, { blob: blob, objectUrl: objectUrl, ts: Date.now() });
+            while (store.size > MAX_ITEMS) {
+                const oldest = store.keys().next().value;
+                const dropped = store.get(oldest);
+                URL.revokeObjectURL(dropped.objectUrl);
+                store.delete(oldest);
+            }
+            log('已存 ' + (blob.size / 1024).toFixed(1) + 'KB 共' + store.size + '张 ' + url.slice(0, 70));
+        }
+
+        // 把原 URL 换成本地 Blob URL（uni-image 会写 <img src> 和 background-image 两处）
+        function applyOne(url) {
+            const item = store.get(url);
+            if (!item) return false;
+            let hit = 0;
+
+            const imgs = document.querySelectorAll('img');
+            for (let i = 0; i < imgs.length; i++) {
+                const el = imgs[i];
+                if (el.getAttribute('src') === url || el.src === url) {
+                    el.src = item.objectUrl;
+                    hit++;
+                }
+            }
+
+            const bgs = document.querySelectorAll('[style*="background-image"]');
+            for (let i = 0; i < bgs.length; i++) {
+                const el = bgs[i];
+                const bg = el.style && el.style.backgroundImage;
+                // 属性值里 URL 可能带引号，所以用 indexOf 找子串；split/join 避免 $& 被当成替换模式
+                if (bg && bg.indexOf(url) >= 0) {
+                    el.style.backgroundImage = bg.split(url).join(item.objectUrl);
+                    hit++;
+                }
+            }
+
+            if (hit) {
+                // 挪到末尾，LRU 淘汰时优先保住刚用过的
+                store.delete(url);
+                store.set(url, item);
+                log('已替换 DOM 图片 ' + hit + ' 处 ' + url.slice(0, 70));
+            }
+            return hit > 0;
+        }
+
+        function applyRecent() {
+            if (!store.size) return;
+            const now = Date.now();
+            const fresh = []; // 10 秒内的新图：每次 DOM 变化都试
+            const stale = []; // 更早的图：低频兜底，保证"过一会儿才点开聊天"也能替换
+            store.forEach(function (item, url) {
+                if (now - item.ts < APPLY_WINDOW) fresh.push(url);
+                else stale.push(url);
+            });
+            for (let i = 0; i < fresh.length; i++) applyOne(fresh[i]);
+            if (stale.length && now - lastStaleScan > 2500) {
+                lastStaleScan = now;
+                for (let i = 0; i < stale.length; i++) applyOne(stale[i]);
+            }
+        }
+
+        // 摘掉"点击查看"遮罩（纯 CSS 层，摘掉即露图，不模拟点击）
+        function unmask() {
+            let removed = 0;
+            const nodes = document.querySelectorAll('uni-text, span');
+            for (let i = 0; i < nodes.length; i++) {
+                const t = nodes[i];
+                if (t.children.length) continue;               // 只看叶子，避免父节点重复匹配
+                if (!/点击查看/.test(t.textContent || '')) continue;
+                let el = t.parentElement;
+                for (let hops = 0; el && hops < 6; hops++, el = el.parentElement) {
+                    const st = el.style;
+                    if (!st) continue;
+                    const blur = st.backdropFilter || st.webkitBackdropFilter || '';
+                    const bg = (st.background || '') + (st.backgroundColor || '');
+                    // 命中遮罩特征：backdrop blur，或半透明黑底
+                    if (/blur\(/.test(blur) || /rgba\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\.\d+/.test(bg)) {
+                        el.remove();
+                        removed++;
+                        break;
+                    }
+                    if (el.tagName === 'UNI-IMAGE') break;      // 走过头了，放弃这张
+                }
+            }
+            if (removed) log('已自动摘除"点击查看"遮罩 ' + removed + ' 处');
+        }
+
+        function scheduleApply() {
+            if (scheduled) return;
+            scheduled = true;
+            requestAnimationFrame(function () {
+                scheduled = false;
+                unmask();      // 遮罩随消息一起渲染，先摘掉再看要不要换图
+                applyRecent();
+            });
+        }
+
+        // document-start 阶段 documentElement 还不存在，等它出现再挂
+        function ensureObserver() {
+            if (observer || typeof MutationObserver === 'undefined') return;
+            if (!document.documentElement) return;
+            observer = new MutationObserver(scheduleApply);
+            observer.observe(document.documentElement, {
+                subtree: true,
+                childList: true,
+                attributes: true,
+                attributeFilter: ['src', 'style']
+            });
+        }
+
+        function capture(url) {
+            url = normalizeUrl(url);
+            if (!enabled || !isImageUrl(url)) return;
+            if (store.has(url) || inflight.has(url)) return;
+            inflight.add(url);
+            log('开始抓取 ' + url.slice(0, 120));
+
+            // 第一路：原生图片管线预热 HTTP 缓存，不设 crossOrigin，不受 CORS 限制
+            const warm = new Image();
+            if ('decoding' in warm) warm.decoding = 'async';
+            warm.src = url;
+
+            // 第二路：并行取 blob 做长期保留。需要 CORS，失败就只留页面缓存，不影响显示。
+            fetch(url, { mode: 'cors', credentials: 'omit', cache: 'force-cache' })
+                .then(function (r) {
+                    return r.ok ? r.blob() : Promise.reject(new Error('HTTP ' + r.status));
+                })
+                .then(function (blob) {
+                    if (blob && blob.size) {
+                        save(url, blob);
+                        applyOne(url);
+                    }
+                })
+                .catch(function (e) {
+                    log('blob 获取失败（多半是无 CORS，仅保留页面缓存）', url.slice(0, 70), e && e.message);
+                })
+                .then(function () { inflight.delete(url); });
+        }
+
+        return {
+            // 由 SocketBridge 的 onRawFrame 回调驱动
+            onFrame: function (pkt, binary, direction) {
+                const dir = direction === 'out' ? '发' : '收';
+                ensureObserver();
+                if (binary) {
+                    log('[探针] 方向=' + dir + ' 二进制帧 大小=' +
+                        ((binary && binary.size) || (binary && binary.byteLength) || '?'));
+                    return;
+                }
+                if (!pkt) return;
+
+                // 探针：默认每种事件只记第一帧，开抓包模式后每帧都记
+                const n = (eventHits.get(pkt.event) || 0) + 1;
+                eventHits.set(pkt.event, n);
+                if (probe || n === 1) {
+                    let dump = '';
+                    try { dump = JSON.stringify(pkt.args); } catch (e) { dump = '[无法序列化]'; }
+                    if (dump.length > 1500) dump = dump.slice(0, 1500) + '...[截断]';
+                    log('[探针] 方向=' + dir + ' 第' + n + '帧 类型=' + pkt.type +
+                        ' 事件=' + pkt.event + ' 载荷=' + dump);
+                }
+
+                if (!enabled) return;
+                const urls = [];
+                if (pkt.event === 'strangerMessage' || pkt.event === 'clientMessage') {
+                    // 协议已确认：对方(strangerMessage)/自己(clientMessage)图片消息都是
+                    // { msgId, content, options:{ isImage, chatId, pulp } }，用 isImage 判断
+                    const m = pkt.args && pkt.args[0] && typeof pkt.args[0] === 'object' ? pkt.args[0] : {};
+                    if (m && m.options && m.options.isImage && typeof m.content === 'string' && m.content) {
+                        urls.push(m.content);
+                    }
+                } else {
+                    extract(pkt.args, urls, 0);
+                }
+                if (!urls.length) return;
+                log('方向=' + dir + ' 事件=' + pkt.event + ' 命中图片 ' + urls.length + ' 个 -> ' + urls.join(' , '));
+                for (let i = 0; i < urls.length; i++) capture(urls[i]);
+            },
+
+            // 确需要 base64 时再用它，日常显示走 Blob URL 更快更省内存
+            toBase64: function (url) {
+                return new Promise(function (resolve, reject) {
+                    const item = store.get(url);
+                    if (!item) { reject(new Error('未缓存该图片')); return; }
+                    const fr = new FileReader();
+                    fr.onload = function () { resolve(fr.result); };
+                    fr.onerror = reject;
+                    fr.readAsDataURL(item.blob);
+                });
+            },
+
+            dumpLog: function () { return logBuf.join('\n'); },
+
+            clear: function () {
+                store.forEach(function (item) { URL.revokeObjectURL(item.objectUrl); });
+                store.clear();
+                inflight.clear();
+            }
+        };
+    })();
+    SocketBridge.bind({
+        onRawFrame: function (pkt, binary, direction) { ImageVault.onFrame(pkt, binary, direction); }
+    });
+
+    // 日志导出：控制台执行 __ssbyImgLogCopy() 直接复制到剪贴板，或 __ssbyImgLog() 拿到纯文本
+    window.__ssbyImgLog = function () { return ImageVault.dumpLog(); };
+    window.__ssbyImgLogCopy = function () {
+        const text = ImageVault.dumpLog();
+        const lines = text ? text.split('\n').length : 0;
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.top = '-1000px';
+            document.body.appendChild(ta);
+            ta.select();
+            const ok = document.execCommand('copy');
+            document.body.removeChild(ta);
+            return ok ? ('已复制 ' + lines + ' 行到剪贴板') : '复制失败，请手动选中控制台输出';
+        } catch (e) {
+            return '复制失败：' + e.message;
+        }
+    };
 
     function createAssistiveTouchMenu() {
         const style = document.createElement('style');
@@ -454,16 +1119,27 @@
         // 状态变量
         let isOpen = false;
         let isOn = false;
+        // 默认问候语（初始化与保存兜底共用，避免清空后只剩一条、导致“永远随机到同一条”）
+        const DEFAULT_GREETINGS = ['哈喽', '你好呀', '很高兴认识你！', '嗨～'];
+        // 清洗问候语列表：只保留非空字符串，全部无效时回退默认
+        function normalizeGreetingList(list) {
+            if (!Array.isArray(list)) return DEFAULT_GREETINGS.slice();
+            const out = [];
+            for (let i = 0; i < list.length; i++) {
+                const v = list[i];
+                if (typeof v === 'string' && v.trim()) out.push(v.trim());
+            }
+            return out.length > 0 ? out : DEFAULT_GREETINGS.slice();
+        }
         // 问候语（JSON数组）
-        let greetingList = [];
+        let greetingList = DEFAULT_GREETINGS.slice();
         try {
             const saved = localStorage.getItem('ssby_greeting_list');
             if (saved) {
-                greetingList = JSON.parse(saved);
+                greetingList = normalizeGreetingList(JSON.parse(saved));
             }
-        } catch (e) {}
-        if (!Array.isArray(greetingList) || greetingList.length === 0) {
-            greetingList = ['哈喽', '你好呀', '很高兴认识你！', '嗨～'];
+        } catch (e) {
+            greetingList = DEFAULT_GREETINGS.slice();
         }
         // 循环定时器
         let timer = null;
@@ -497,6 +1173,15 @@
             console.log('[SSBY] 女生离开继续刷开关:', autoLeaveEnabled);
         } catch (e) {
             console.log('[SSBY] 读取autoLeaveEnabled失败:', e);
+        }
+
+        // 人机自动跳过开关，默认开启
+        let botSkipEnabled = true;
+        try {
+            botSkipEnabled = localStorage.getItem('botSkipEnabled') !== 'false';
+            console.log('[SSBY] 人机自动跳过开关:', botSkipEnabled);
+        } catch (e) {
+            console.log('[SSBY] 读取botSkipEnabled失败:', e);
         }
 
         const switchBtn = document.createElement('div');
@@ -555,6 +1240,7 @@
                     greenTimer = null;
                 }
                 updateBreath('blue');
+                SocketBridge.reset();
             }
         };
 
@@ -566,14 +1252,24 @@
             const modal = document.createElement('div');
             modal.className = 'at-modal';
 
+            // 编辑期间只改草稿，取消/关闭不污染真实列表
+            let draftList = greetingList.slice();
+
+            // 转义 HTML，避免问候语里的 < > & " 破坏弹窗结构
+            function escapeHtml(str) {
+                return String(str).replace(/[&<>"']/g, function (c) {
+                    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+                });
+            }
+
             // 构建问候语列表HTML
             function buildGreetingListHTML() {
                 let html = '';
-                greetingList.forEach((item, index) => {
+                draftList.forEach((item, index) => {
                     html += `
                         <div class="at-greeting-item" data-index="${index}">
                             <span class="at-greeting-drag">⋮⋮</span>
-                            <input class="at-greeting-text" type="text" value="${item.replace(/"/g, '&quot;')}" maxlength="20" />
+                            <input class="at-greeting-text" type="text" value="${escapeHtml(item)}" maxlength="20" />
                             <span class="at-greeting-delete" data-index="${index}">删除</span>
                         </div>`;
                 });
@@ -600,6 +1296,10 @@
                     <span class="at-auto-leave-switch-label">女生离开继续刷：</span>
                     <div id="autoLeaveToggle" class="at-auto-leave-switch-toggle" role="switch" tabindex="0" aria-checked="false"></div>
                 </div>
+                <div class="at-auto-leave-switch">
+                    <span class="at-auto-leave-switch-label">人机自动跳过：</span>
+                    <div id="botSkipToggle" class="at-auto-leave-switch-toggle" role="switch" tabindex="0" aria-checked="true"></div>
+                </div>
                 <div class="at-modal-footer">
                     <button class="at-modal-btn at-modal-btn-cancel" id="atSettingsCancelBtn">取消</button>
                     <button class="at-modal-btn at-modal-btn-save" id="atSettingsSaveBtn">保存</button>
@@ -624,18 +1324,22 @@
                     const val = input.value.trim();
                     if (val) newList.push(val);
                 });
-                greetingList = newList.length > 0 ? newList : ['哈喽'];
+                greetingList = normalizeGreetingList(newList);
                 try {
                     localStorage.setItem('ssby_greeting_list', JSON.stringify(greetingList));
                     console.log('[SSBY] 问候语列表已保存:', greetingList);
                 } catch (e) {}
+                // 本轮已选中的问候语若被删除或改掉，下轮重新随机
+                if (currentGreeting && greetingList.indexOf(currentGreeting) === -1) {
+                    currentGreeting = '';
+                }
                 mask.remove();
             };
 
             // 添加问候语
             modal.querySelector('#atGreetingAddBtn').onclick = function() {
-                if (greetingList.length >= 6) return;
-                greetingList.push('');
+                if (draftList.length >= 6) return;
+                draftList.push('');
                 renderGreetingList();
             };
 
@@ -651,17 +1355,17 @@
                 // 删除按钮
                 modal.querySelectorAll('.at-greeting-delete').forEach(btn => {
                     btn.onclick = function() {
-                        const idx = parseInt(this.dataset.index);
-                        greetingList.splice(idx, 1);
+                        const idx = parseInt(this.dataset.index, 10);
+                        draftList.splice(idx, 1);
                         renderGreetingList();
                     };
                 });
-                // 输入框变化时同步到greetingList
+                // 输入框变化时同步到草稿（不 trim，保存时再 trim，避免输入中空格被吃掉）
                 modal.querySelectorAll('.at-greeting-text').forEach(input => {
                     input.oninput = function() {
                         const item = this.closest('.at-greeting-item');
-                        const idx = parseInt(item.dataset.index);
-                        greetingList[idx] = this.value.trim();
+                        const idx = parseInt(item.dataset.index, 10);
+                        draftList[idx] = this.value;
                     };
                 });
             }
@@ -697,6 +1401,32 @@
                     }
                 });
 
+            }
+
+            const botToggle = modal.querySelector('#botSkipToggle');
+            if (botToggle) {
+                // 默认开启，仅显式存 false 时关闭
+                try {
+                    const enabled = localStorage.getItem('botSkipEnabled') !== 'false';
+                    botToggle.classList.toggle('active', enabled);
+                    botToggle.setAttribute('aria-checked', enabled ? 'true' : 'false');
+                } catch (e) {
+                    botToggle.classList.add('active');
+                    botToggle.setAttribute('aria-checked', 'true');
+                }
+
+                botToggle.addEventListener('click', function() {
+                    const next = !botToggle.classList.contains('active');
+                    botToggle.classList.toggle('active', next);
+                    botToggle.setAttribute('aria-checked', next ? 'true' : 'false');
+                    try {
+                        localStorage.setItem('botSkipEnabled', next ? 'true' : 'false');
+                        botSkipEnabled = next;
+                        console.log('[SSBY] 人机自动跳过开关已切换:', next);
+                    } catch (e) {
+                        console.log('[SSBY] 保存botSkipEnabled失败:', e);
+                    }
+                });
             }
 
         }
@@ -856,11 +1586,50 @@
             return count > 0;
         }
 
+        // 呼吸灯变绿所需聊天时长（3 分 10 秒）
+        const GREEN_DELAY_MS = 190000;
+
+        // 重置呼吸灯为蓝色并清掉变绿定时器
+        function resetGreenState() {
+            if (greenTimer) {
+                clearTimeout(greenTimer);
+                greenTimer = null;
+            }
+            if (state !== 'blue') {
+                state = 'blue';
+                updateBreath(state);
+            }
+        }
+
+        // 启动变绿计时：优先用接口层记录的配对成功时间校准，接口不可用时退回从当前时刻起算
+        function startGreenTimer() {
+            if (greenTimer || state === 'green') return;
+            let delay = GREEN_DELAY_MS;
+            const connectedAt = SocketBridge.getConnectedAt ? SocketBridge.getConnectedAt() : 0;
+            if (connectedAt) {
+                delay = Math.max(0, GREEN_DELAY_MS - (Date.now() - connectedAt));
+            }
+            console.log('[SSBY] 启动变绿计时: ' + delay + 'ms 后变绿（接口校正=' + (connectedAt ? '是' : '否') + '）');
+            greenTimer = setTimeout(function () {
+                greenTimer = null;
+                state = 'green';
+                updateBreath(state);
+            }, delay);
+        }
+
         // 打招呼
         function stay() {
             console.log('[SSBY] stay() 函数被调用');
             if (isTyping) {
                 console.log('[SSBY] 正在输入中，跳过');
+                return;
+            }
+
+            // 打招呼前再拦一次，防止接口帧晚于 DOM 时白发消息
+            if (botSkipEnabled && isBotPartner()) {
+                console.log('[SSBY] 打招呼前命中人机，跳过');
+                leave();
+                loopCount = 0;
                 return;
             }
 
@@ -877,9 +1646,7 @@
 
             // 仅在首次时随机选择一条问候语，之后固定使用（避免每轮循环换一条）
             if (!currentGreeting) {
-                if (!Array.isArray(greetingList) || greetingList.length === 0) {
-                    greetingList = ['哈喽', '你好呀', '很高兴认识你！', '嗨～'];
-                }
+                greetingList = normalizeGreetingList(greetingList);
                 currentGreeting = greetingList[Math.floor(Math.random() * greetingList.length)];
             }
             console.log('[SSBY] 开始输入问候语:', currentGreeting);
@@ -895,39 +1662,46 @@
                         lastGreeted = true;
                     }
                 }
-                if (state === 'green') {
-                    state = 'blue';
-                    updateBreath(state);
-                }
-                if (!greenTimer && state !== 'green') {
-                    greenTimer = setTimeout(() => {
-                        state = 'green';
-                        updateBreath(state);
-                    }, 210000);
-                }
+                startGreenTimer();
             });
+        }
+
+        // 重置本轮状态（离开时必须调用，否则问候语会一直沿用第一次随机到的那条）
+        function resetRoundState() {
+            lastChatId = null;
+            lastGenderInfo = null;
+            SocketBridge.consumePartner(); // 清掉接口层缓存的搭档资料，避免下轮误读旧性别重复离开
+            lastGreeted = false;
+            lastSelfMessageCount = 0;
+            currentGreeting = ''; // 重置问候语，下次打招呼重新随机选一条
         }
 
         // 离开
         function leave() {
             console.log('[SSBY] leave() 函数被调用');
-            if (greenTimer) {
-                clearTimeout(greenTimer);
-                greenTimer = null;
+            // 优先用接口结束并重新匹配
+            if (SocketBridge.isActive()) {
+                const p = SocketBridge.takePartner();
+                const chatId = p ? p.chatId : null;
+                if (chatId && SocketBridge.endAndRematch()) {
+                    console.log('[SSBY] 接口切换已发起，跳过 DOM 离开流程');
+                    resetGreenState();
+                    resetRoundState(); // 接口分支不会走 domLeave，这里必须单独重置
+                    return;
+                }
+                console.log('[SSBY] 接口切换不可用，回退 DOM 离开流程');
             }
-            if (state !== 'blue') {
-                state = 'blue';
-                updateBreath(state);
-            }
+            SocketBridge.consumePartner();
+            domLeave();
+        }
+
+        // 接口不可用时的纯 DOM 离开兜底
+        function domLeave() {
+            resetGreenState();
 
             adjustLoopSpeed(false);
 
-            // 重置缓存
-            lastChatId = null;
-            lastGenderInfo = null;
-            lastGreeted = false;
-            lastSelfMessageCount = 0;
-            currentGreeting = ''; // 重置问候语，下次打招呼重新随机选一条
+            resetRoundState();
 
             // 尝试点击离开聊天按钮
             const clicked = clickLeaveChatButton();
@@ -948,30 +1722,26 @@
             }
         }
 
-        // 是否离开了
-        function isPartnerLeft() {
-            const noticeEl = document.querySelector('.notice-message');
-            if (noticeEl) {
-                const text = noticeEl.textContent;
-                const leftMessages = [
-                    '对方离开了',
-                    '您断开了连线',
-                ];
-                const result = leftMessages.some(msg => text.includes(msg));
-                // 只在状态变化时输出日志
-                if (result !== lastPartnerLeft) {
-                    console.log('[SSBY] 对方离开状态变化:', lastPartnerLeft, '->', result);
-                    lastPartnerLeft = result;
-                }
-                return result;
+        // 人机判定：wordFilter=0 且（标签仅"清流"一条，或 extra 带 isWeixin 键）
+        // 取不到接口数据时返回 false，宁可放过也不误杀
+        function isBotPartner() {
+            const profile = SocketBridge.getPartnerProfile();
+            if (!profile) return false;
+
+            const labels = Array.isArray(profile.labels) ? profile.labels : [];
+            const onlyQingliu = labels.length === 1 && String(labels[0] && labels[0].name) === '清流';
+            const bot = profile.wordFilter === 0 && (onlyQingliu || profile.hasWeixinKey === true);
+            if (bot) {
+                console.log('[SSBY] 命中人机特征:', JSON.stringify(profile));
             }
-            return false;
+            return bot;
         }
 
         // 自动聊天逻辑（性能优化版）
         function autoChatLoop() {
             loopCount++;
             console.log('[SSBY] ========== autoChatLoop() 开始 (第', loopCount, '次) ==========');
+            console.log('[SSBY] 状态: 接口加速=' + (SocketBridge.isActive() ? '启用' : '未启用'));
 
             // 获取性别信息（带缓存）
             const genderInfo = getGenderInfo();
@@ -989,6 +1759,11 @@
                     } else {
                         console.log('[SSBY] 女生离开，但开关未开启，不执行离开');
                     }
+                } else if (botSkipEnabled && isBotPartner()) {
+                    // 命中人机，即便是女生也跳过继续刷
+                    console.log('[SSBY] 检测到人机，跳过继续刷');
+                    leave();
+                    loopCount = 0;
                 } else {
                     // 检查是否已经打过招呼
                     const currentGreeted = hasSentMessage();
@@ -1166,6 +1941,16 @@
 
         // 获取性别信息（带缓存）
         function getGenderInfo() {
+            // 接口快通道：优先读取 socket 搭档资料
+            if (SocketBridge.isActive()) {
+                const p = SocketBridge.takePartner();
+                if (p) {
+                    if (p.gender === '男') adjustLoopSpeed(false);
+                    console.log('[SSBY] 接口快通道读取性别:', p.gender === '男' ? '男生' : '女生');
+                    return p.gender === '男' ? '男生' : '女生';
+                }
+                console.log('[SSBY] 接口缓存为空，回退 DOM 扫描性别');
+            }
             const spans = document.querySelectorAll('span');
             console.log('[SSBY] 找到', spans.length, '个span元素');
 
@@ -1174,6 +1959,7 @@
                 const text = span.textContent || '';
                 if (text.includes('女生') || text.includes('男生')) {
                     console.log('[SSBY] 找到性别信息:', text);
+                    console.log('[SSBY] 性别来源: DOM 扫描');
 
                     // 检查性别是否变化
                     if (lastGenderInfo !== text) {
@@ -1199,7 +1985,7 @@
             return null;
         }
 
-        // 是否离开了（带缓存）
+        // 对方是否已离开
         function isPartnerLeft() {
             const noticeEl = document.querySelector('.notice-message');
             if (noticeEl) {
@@ -1209,8 +1995,8 @@
                     '您断开了连线',
                 ];
                 const result = leftMessages.some(msg => text.includes(msg));
-                
-                // 检测到状态变化才输出日志
+
+                // 状态变化时才输出日志
                 if (result !== lastPartnerLeft) {
                     console.log('[SSBY] 对方离开状态变化:', lastPartnerLeft, '->', result);
                     lastPartnerLeft = result;
@@ -1380,6 +2166,10 @@
         root.appendChild(mainBtn);
         root.appendChild(panel);
         document.body.appendChild(root);
+        SocketBridge.bind({
+            isOn: function () { return isOn; },
+            fallbackLeave: domLeave
+        });
         // 初始化呼吸光
         updateBreath(state);
         // 初始化面板展开方向
@@ -1388,7 +2178,14 @@
 
     // 初始化
     console.log('[SSBY] ========== 脚本开始初始化 ==========');
-    createAssistiveTouchMenu();
+    // document-start 下需等 body 就绪再挂载悬浮球（接口桥接已在顶部提前安装）
+    if (document.body) {
+        createAssistiveTouchMenu();
+    } else {
+        document.addEventListener('DOMContentLoaded', function () {
+            createAssistiveTouchMenu();
+        }, { once: true });
+    }
     console.log('[SSBY] ========== 脚本初始化完成 ==========');
 })();
 

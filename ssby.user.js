@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         桃趣乐友叔叔不约小助手
 // @namespace    https://www.shushubuyue.net/
-// @version      2.8
+// @version      2.9
 // @description  桃趣乐友叔叔不约小助手，关注“桃趣乐友”公众号享受最新版本。
 // @author       桃趣乐友
 // @match        *://shushubuyue.net/*
@@ -25,6 +25,22 @@
 (function() {
     'use strict';
 
+    // ============ 日志开关 ============
+    // 开发调试时改成 true 输出全部日志；日常使用保持 false
+    // 仅静默本脚本日志（统一以 [SSBY] 开头），不影响站点与其它脚本的输出
+    const DEBUG = false;
+    if (!DEBUG) {
+        try {
+            const nativeLog = console.log;
+            // 只静默本脚本的日志（统一以 [SSBY] 开头），站点与其它脚本的输出原样透传
+            console.log = function () {
+                const first = arguments.length > 0 ? arguments[0] : '';
+                if (typeof first === 'string' && first.indexOf('[SSBY]') === 0) return;
+                nativeLog.apply(console, arguments);
+            };
+        } catch (e) { /* 某些环境 console 不可写，忽略，仅影响日志静默 */ }
+    }
+
     // SocketBridge：通过 WebSocket 接口层加速切换与读取对方信息，接口不可用时回退 DOM 逻辑。
     const SocketBridge = (function () {
         'use strict';
@@ -36,12 +52,20 @@
         const MIN_REMATCH_DELAY_MS = 500;  // 结束确认后、重发 new 前的最小间隔
         const END_ACK_TIMEOUT_MS = 3000;   // 结束回执超时，超时回退 DOM
         const PARTNER_CACHE_TTL_MS = 8000;    // 搭档资料有效期，防跨会话串场
-        const PARTNER_PROFILE_TTL_MS = 60000; // 人机特征有效期，比搭档资料长，防漏判
+        // 不算"对方反馈"的事件：心跳类，以及自己消息的回声（clientMessage）
+        const ACTIVITY_IGNORE_EVENTS = ['heartbeat', 'heartBeat', 'ping', 'pong',
+            'sysHeartbeat', 'heartbeatAck', 'keepAlive', 'clientMessage'];
+
+        function isIgnoredActivityEvent(event) {
+            return ACTIVITY_IGNORE_EVENTS.indexOf(String(event)) >= 0;
+        }
 
         const deps = {
             isOn: function () { return false; }, // 主循环是否开启
             fallbackLeave: null,                 // 纯 DOM 离开函数
-            onRawFrame: null                     // 非 syscmd 事件帧 / 二进制帧交给外部处理
+            onRawFrame: null,                    // 非 syscmd 事件帧 / 二进制帧交给外部处理
+            onPartnerMessage: null,              // 收到对方消息（strangerMessage 事件）时通知外部
+            onPartnerActivity: null              // 收到对方任意反馈（除心跳）时通知外部
         };
 
         let bridgeInstalled = false; // 是否已成功钩住 WebSocket
@@ -50,15 +74,15 @@
         let socketCurrent = null;
         let socketPacketId = 0;      // 自建 ackId 自增计数
         let socketNewPayload = null; // 捕获的 new 载荷
-        let partnerCache = null;     // { chatId, gender, ts }
-        let partnerProfile = null;   // { chatId, wordFilter, labels, hasWeixinKey, ts }
+        let partnerCache = null;     // { chatId, gender, userId, ts }
+        let partnerUserId = '';      // 当前对方用户ID（从 connected 帧提取，跨会话稳定）
         let socketFlowOwned = false;
         let socketMatchInProgress = false;
         let socketEndPending = false;
         let socketEndPacketId = null;
         let socketHandledChatId = null;
         let endTimeoutTimer = null;
-        let lastConnectedAt = 0; // 最近一次配对成功（connected）的时间戳
+        let partnerSession = null;   // 当前会话 { chatId, userId, at }，at 为本会话准确的开始时间
 
         function socketDisabled() {
             try { return localStorage.getItem('ssby_socket_disabled') === 'true'; }
@@ -111,32 +135,36 @@
             catch (e) { return false; }
         }
 
+        // 对方用户ID的候选字段名（connected 帧实测为顶层 partnerIdEncrypted，放首位）
+        const PARTNER_ID_KEYS = ['partnerIdEncrypted', 'userId', 'strUserId', 'uid', 'strUid',
+            'userNo', 'strUserNo', 'strNumber', 'strAccount', 'accountId', 'strAccountId',
+            'partnerUserId', 'strPartnerUserId', 'targetUserId'];
+        // 顶层字段用更严格的候选，避免误取通用 id
+        const PARTNER_ID_KEYS_TOP = ['partnerIdEncrypted', 'userId', 'strUserId', 'partnerUserId',
+            'targetUserId', 'strPartnerUserId', 'uid', 'strUid', 'userNo', 'strUserNo'];
+
+        function pickPartnerId(source, keys) {
+            if (!source || typeof source !== 'object') return '';
+            for (let i = 0; i < keys.length; i++) {
+                const v = source[keys[i]];
+                if (v != null && String(v).trim()) return String(v).trim();
+            }
+            return '';
+        }
+
         function parsePartner(command) {
             const info = command && typeof command === 'object' ? command : {};
             const pInfo = info.partnerInfoObj && typeof info.partnerInfoObj === 'object'
                 ? info.partnerInfoObj : {};
             const gRaw = pInfo.strGender != null ? pInfo.strGender : info.strGender;
             const chatId = typeof info.chatId === 'string' ? info.chatId : '';
+            const userId = pickPartnerId(pInfo, PARTNER_ID_KEYS) || pickPartnerId(info, PARTNER_ID_KEYS_TOP);
             const g = String(gRaw == null ? '' : gRaw).trim().toLowerCase();
             let gender = '';
             if (g === 'm' || g.indexOf('男') >= 0) gender = '男';
             else if (g === 'f' || g.indexOf('女') >= 0) gender = '女';
             if (!gender || !chatId) return null;
-            return { gender: gender, chatId: chatId };
-        }
-
-        // 提取 connected 帧里的人机特征，判定逻辑交给外部
-        function parseBotSignals(command) {
-            const info = command && typeof command === 'object' ? command : {};
-            const pInfo = info.partnerInfoObj && typeof info.partnerInfoObj === 'object'
-                ? info.partnerInfoObj : {};
-            const wf = pInfo.wordFilter;
-            return {
-                wordFilter: typeof wf === 'number' ? wf : null,
-                labels: Array.isArray(info.labels) ? info.labels : [],
-                hasWeixinKey: !!(info.extra && typeof info.extra === 'object' &&
-                    Object.prototype.hasOwnProperty.call(info.extra, 'isWeixin'))
-            };
+            return { gender: gender, chatId: chatId, userId: userId };
         }
 
         function onEndAck() {
@@ -159,6 +187,8 @@
                 socketMatchInProgress = true;
                 socketHandledChatId = null;
                 partnerCache = null;
+                partnerUserId = '';
+                partnerSession = null;
                 if (!sendEvent('syscmd', payload, false)) {
                     console.log('[SSBY] 重发 new 失败，回退 DOM');
                     if (deps.fallbackLeave) deps.fallbackLeave();
@@ -180,6 +210,14 @@
                 return;
             }
             if (pkt.event !== 'syscmd') {
+                // 协议已确认：strangerMessage = 对方发来的消息，用于统计对方说了几句
+                if (pkt.event === 'strangerMessage' && deps.onPartnerMessage) {
+                    deps.onPartnerMessage(pkt.args && pkt.args[0]);
+                }
+                // 除心跳和自己消息回声外，任何收到的业务事件都算"对方有反馈"
+                if (deps.onPartnerActivity && !isIgnoredActivityEvent(pkt.event)) {
+                    deps.onPartnerActivity(pkt.event);
+                }
                 if (deps.onRawFrame) deps.onRawFrame(pkt, null, 'in');
                 return;
             }
@@ -192,19 +230,31 @@
             }
             if (msg === 'connected') {
                 socketMatchInProgress = false;
-                lastConnectedAt = Date.now();
                 const partner = parsePartner(cmd);
-                const signal = parseBotSignals(cmd);
-                partnerProfile = {
-                    chatId: partner ? partner.chatId
-                        : (typeof cmd.chatId === 'string' ? cmd.chatId : ''),
-                    wordFilter: signal.wordFilter,
-                    labels: signal.labels,
-                    hasWeixinKey: signal.hasWeixinKey,
-                    ts: Date.now()
-                };
+                // 提取对方用户ID：chatId 是随机会话号，只有 partnerIdEncrypted 稳定
+                const cmdInfo = cmd && typeof cmd === 'object' ? cmd : {};
+                const cmdPInfo = cmdInfo.partnerInfoObj && typeof cmdInfo.partnerInfoObj === 'object'
+                    ? cmdInfo.partnerInfoObj : {};
+                partnerUserId = pickPartnerId(cmdPInfo, PARTNER_ID_KEYS)
+                    || pickPartnerId(cmdInfo, PARTNER_ID_KEYS_TOP);
+                const pInfoKeys = (cmd && cmd.partnerInfoObj && typeof cmd.partnerInfoObj === 'object')
+                    ? Object.keys(cmd.partnerInfoObj) : [];
+                console.log('[SSBY] connected 解析: 对方资料字段=[' + pInfoKeys.join(',') +
+                    '] 顶层字段=[' + Object.keys(cmd || {}).join(',') + '] 提取ID=' + (partnerUserId || '(空)'));
+                try {
+                    // 需要核对完整字段时：localStorage.setItem('ssby_dump_connected','true') 后刷新网页
+                    if (localStorage.getItem('ssby_dump_connected') === 'true') {
+                        let dump = '';
+                        try { dump = JSON.stringify(cmd); } catch (e) { dump = '[无法序列化]'; }
+                        console.log('[SSBY][connected 原始帧]', dump);
+                    }
+                } catch (e) {}
+                // 记录本会话准确的开始时间（以会话ID标识，供呼吸灯计时校准）
+                const sessionChatId = partner ? partner.chatId
+                    : (typeof cmd.chatId === 'string' ? cmd.chatId : '');
+                partnerSession = { chatId: sessionChatId, userId: partnerUserId, at: Date.now() };
                 if (partner) {
-                    partnerCache = { chatId: partner.chatId, gender: partner.gender, ts: Date.now() };
+                    partnerCache = { chatId: partner.chatId, gender: partner.gender, userId: partner.userId, ts: Date.now() };
                     socketHandledChatId = partner.chatId;
                 }
             } else if (msg === 'end' || msg === 'endByPartner') {
@@ -236,6 +286,9 @@
                     socketOpen = false;
                     socketFlowOwned = false;
                     socketMatchInProgress = false;
+                    // 断线后会话信息不可信，清掉，避免旧会话的时间/身份被误用
+                    partnerSession = null;
+                    partnerUserId = '';
                     if (socketEndPending) {
                         socketEndPending = false;
                         socketEndPacketId = null;
@@ -267,6 +320,8 @@
                         socketEndPending = false;
                         socketHandledChatId = null;
                         partnerCache = null;
+                        partnerUserId = '';
+                        partnerSession = null;
                         console.log('[SSBY] 已捕获 new 载荷，准备接口加速');
                     }
                 } else if (pkt) {
@@ -298,7 +353,8 @@
 
         function consumePartner() {
             partnerCache = null;
-            partnerProfile = null;
+            partnerUserId = '';
+            partnerSession = null; // 会话结束，旧会话开始时间随之失效
             socketHandledChatId = null;
         }
 
@@ -330,8 +386,8 @@
             socketEndPacketId = null;
             socketHandledChatId = null;
             partnerCache = null;
-            partnerProfile = null;
-            lastConnectedAt = 0;
+            partnerUserId = '';
+            partnerSession = null;
             if (endTimeoutTimer) { clearTimeout(endTimeoutTimer); endTimeoutTimer = null; }
         }
 
@@ -343,20 +399,14 @@
             install: install,
             isActive: isActive,
             takePartner: takePartner,
-            // 读取人机特征，不消费
-            getPartnerProfile: function () {
-                if (!isActive() || !partnerProfile) return null;
-                if (Date.now() - partnerProfile.ts > PARTNER_PROFILE_TTL_MS) {
-                    partnerProfile = null;
-                    return null;
-                }
-                return partnerProfile;
-            },
             endAndRematch: endAndRematch,
             consumePartner: consumePartner,
             reset: reset,
             bind: bind,
-            getConnectedAt: function () { return lastConnectedAt; }
+            // 读取当前对方用户ID（从 connected 帧提取，不消费、不受主循环开关影响）
+            getPartnerUserId: function () { return partnerUserId; },
+            // 读取当前会话开始信息 { chatId, userId, at }；会话结束后清空
+            getSessionStart: function () { return partnerSession; }
         };
     })();
     SocketBridge.install();
@@ -779,7 +829,7 @@
             font-size: 24px;
             box-shadow: 0 2px 8px rgba(0,0,0,0.10), 0 1px 2px #fff inset;
             cursor: pointer;
-            transition: box-shadow 0.2s, background 0.2s;
+            transition: box-shadow 0.2s, background 0.2s, transform 0.2s;
         }
         .at-menu-item:active {
             background: #e6f0ff;
@@ -791,6 +841,24 @@
         .at-menu-item.green-breath {
             animation: at-green-breath 1.8s infinite alternate !important;
             box-shadow: 0 0 24px 8px #22c55e66, 0 4px 24px 0 rgba(0,0,0,0.18) !important;
+        }
+        .at-menu-item:hover {
+            background: #eef4ff;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.16), 0 1px 2px #fff inset;
+            transform: translateY(-1px);
+        }
+        /* 已拉黑状态：整颗按钮变红即可，不加发散光效 */
+        .at-menu-item.blocked {
+            background: linear-gradient(145deg, #ff6b6b 60%, #e53935 100%);
+            box-shadow: 0 2px 8px rgba(0,0,0,0.16);
+        }
+        .at-menu-item.blocked:hover {
+            background: linear-gradient(145deg, #ff7b7b 60%, #ef5350 100%);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.20);
+        }
+        .at-menu-item.blocked svg path,
+        .at-menu-item.blocked svg circle {
+            stroke: #fff;
         }
         /* 设置面板样式 */
         .at-modal-mask {
@@ -1068,12 +1136,72 @@
         .at-modal-btn-cancel:hover {
             background: #eee;
         }
-        .at-modal-btn-save {
+        .at-modal-btn-primary {
             background: #3a7afe;
             color: #fff;
         }
-        .at-modal-btn-save:hover {
+        .at-modal-btn-primary:hover {
             background: #2563eb;
+        }
+        .at-modal-btn-danger {
+            background: #ff4d4f;
+            color: #fff;
+        }
+        .at-modal-btn-danger:hover {
+            background: #e53935;
+        }
+        /* 重置黑名单按钮 */
+        .at-block-reset-btn {
+            padding: 7px 16px;
+            border-radius: 8px;
+            border: 1px solid #ffccc7;
+            background: #fff1f0;
+            color: #ff4d4f;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s;
+            user-select: none;
+        }
+        .at-block-reset-btn:hover {
+            background: #ff4d4f;
+            border-color: #ff4d4f;
+            color: #fff;
+        }
+        /* 跳过不说话女生：超时时间输入框 */
+        .at-silent-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-shrink: 0;
+        }
+        .at-silent-timeout-input {
+            width: 62px;
+            padding: 6px 8px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 14px;
+            color: #333;
+            text-align: center;
+            outline: none;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        .at-silent-timeout-input:focus {
+            border-color: #3a7afe;
+            box-shadow: 0 0 0 3px rgba(58,122,254,0.12);
+        }
+        .at-silent-unit {
+            font-size: 13px;
+            color: #888;
+        }
+        /* 二次确认弹框遮罩（叠在设置弹框之上） */
+        .at-confirm-mask {
+            position: fixed;
+            left: 0; top: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.28);
+            z-index: 1000004;
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
         /* 双击提示样式 */
         .at-double-click-tip {
@@ -1145,7 +1273,8 @@
         let timer = null;
         let state = 'blue';
         let greenTimer = null;
-        let isTyping = false;
+        let silentTimer = null; // 跳过不说话女生的超时计时器
+        let disconnectTipShown = false; // 断连提示是否已弹过（弹框消失后复位）
         // 当前选中的问候语（固定住，避免每轮循环随机变化）
         let currentGreeting = '';
 
@@ -1156,14 +1285,16 @@
         let hasShownTip = false;
 
         // 性能优化：缓存状态
-        let lastChatId = null;
         let lastGenderInfo = null;
         let lastPartnerLeft = false;
         let lastGreeted = false;
         let lastSelfMessageCount = 0;
         let loopCount = 0;
+        let partnerMessageCount = 0; // 本轮对方发来的消息条数（决定何时降频）
+        let partnerActivityCount = 0; // 本轮对方任意反馈次数（除心跳），用于超时跳过判定
         let currentLoopInterval = 1000; // 当前循环间隔
-        const SLOW_LOOP_INTERVAL = 5000; // 慢速循环间隔（已打招呼后）
+        const PARTNER_REPLY_THRESHOLD = 2; // 对方回复达到该条数后才降低循环频率
+        const SLOW_LOOP_INTERVAL = 5000; // 慢速循环间隔（对方已回复后）
         const FAST_LOOP_INTERVAL = 1000; // 快速循环间隔
 
         // 女生离开继续刷开关（从localStorage读取）
@@ -1175,14 +1306,50 @@
             console.log('[SSBY] 读取autoLeaveEnabled失败:', e);
         }
 
-        // 人机自动跳过开关，默认开启
-        let botSkipEnabled = true;
+        // 网络不稳定兼容模式：开启后只用 DOM 切换，避免接口重连抢线
+        let netCompatEnabled = false;
         try {
-            botSkipEnabled = localStorage.getItem('botSkipEnabled') !== 'false';
-            console.log('[SSBY] 人机自动跳过开关:', botSkipEnabled);
+            netCompatEnabled = localStorage.getItem('netCompatEnabled') === 'true';
+            console.log('[SSBY] 网络不稳定兼容模式:', netCompatEnabled);
         } catch (e) {
-            console.log('[SSBY] 读取botSkipEnabled失败:', e);
+            console.log('[SSBY] 读取netCompatEnabled失败:', e);
         }
+
+        // 跳过不说话女生：默认关闭；开场白发出后超时内对方没说话就跳过，默认 10 秒
+        let skipSilentEnabled = false;
+        try {
+            skipSilentEnabled = localStorage.getItem('skipSilentEnabled') === 'true';
+            console.log('[SSBY] 跳过不说话女生:', skipSilentEnabled);
+        } catch (e) {
+            console.log('[SSBY] 读取skipSilentEnabled失败:', e);
+        }
+        let skipSilentTimeoutSec = 10;
+        try {
+            const savedTimeout = parseInt(localStorage.getItem('skipSilentTimeout'), 10);
+            if (savedTimeout >= 3 && savedTimeout <= 120) skipSilentTimeoutSec = savedTimeout;
+        } catch (e) {
+            console.log('[SSBY] 读取skipSilentTimeout失败:', e);
+        }
+
+        // 黑名单：用户手动拉黑的对方ID，存 localStorage 持久化
+        const BLOCK_LIST_KEY = 'ssby_block_list';
+        let blockList = [];
+        try {
+            const savedBlock = localStorage.getItem(BLOCK_LIST_KEY);
+            if (savedBlock) {
+                const arr = JSON.parse(savedBlock);
+                if (Array.isArray(arr)) {
+                    blockList = arr.filter(function (id) { return id != null && String(id); })
+                        .map(function (id) { return String(id); });
+                }
+            }
+            console.log('[SSBY] 黑名单已加载:', blockList);
+        } catch (e) {
+            blockList = [];
+            console.log('[SSBY] 读取黑名单失败:', e);
+        }
+        // 刚手动拉黑的当前会话ID：当前对话先不踢，等本轮结束再遇到才跳过，方便用户反悔取消
+        let blockJustNowChatId = null;
 
         const switchBtn = document.createElement('div');
         switchBtn.className = 'at-menu-item';
@@ -1198,6 +1365,11 @@
         vipBtn.title = '购买会员';
         // 礼物/皇冠图标
         vipBtn.innerHTML = '<svg width="24" height="24" viewBox="0 0 24 24"><path d="M12 2l2.09 6.26L20 9.27l-5 3.64L16.18 20 12 16.77 7.82 20l1.18-7.09-5-3.64 5.91-.99z" fill="none" stroke="#888" stroke-width="2"/></svg>';
+        // 拉黑按钮（第四个图标）
+        const blockBtn = document.createElement('div');
+        blockBtn.className = 'at-menu-item';
+        blockBtn.title = '拉黑对方';
+        blockBtn.innerHTML = '<svg width="24" height="24" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" stroke="#888" stroke-width="2" fill="none"/><path d="M5.6 5.6l12.8 12.8" stroke="#888" stroke-width="2" stroke-linecap="round"/></svg>';
 
         function updateBreath(state) {
             mainBtn.classList.remove('breath', 'green-breath');
@@ -1224,6 +1396,9 @@
             if (isOn && !timer) {
                 console.log('[SSBY] 启动自动聊天循环');
                 state = 'blue';
+                currentLoopInterval = FAST_LOOP_INTERVAL; // 与实际定时器保持一致，避免降频判断失效
+                partnerMessageCount = 0;  // 重新开始统计本轮数据
+                partnerActivityCount = 0;
                 autoChatLoop();
                 timer = setInterval(autoChatLoop, 1000);
                 updateBreath(state);
@@ -1239,6 +1414,7 @@
                     clearTimeout(greenTimer);
                     greenTimer = null;
                 }
+                clearSilentTimer(); // 关脚本时一并停掉"不说话跳过"计时，避免残留触发离开
                 updateBreath('blue');
                 SocketBridge.reset();
             }
@@ -1289,7 +1465,7 @@
                         <span>+</span><span>添加问候语</span>
                     </div>
                     <div class="at-greeting-tip">
-                        <span>💡</span><span>最多可添加 6 条问候语，拖动可调整顺序</span>
+                        <span>💡</span><span>最多可添加 6 条问候语</span>
                     </div>
                 </div>
                 <div class="at-auto-leave-switch">
@@ -1297,26 +1473,27 @@
                     <div id="autoLeaveToggle" class="at-auto-leave-switch-toggle" role="switch" tabindex="0" aria-checked="false"></div>
                 </div>
                 <div class="at-auto-leave-switch">
-                    <span class="at-auto-leave-switch-label">人机自动跳过：</span>
-                    <div id="botSkipToggle" class="at-auto-leave-switch-toggle" role="switch" tabindex="0" aria-checked="true"></div>
+                    <span class="at-auto-leave-switch-label">网络不稳定兼容模式：</span>
+                    <div id="netCompatToggle" class="at-auto-leave-switch-toggle" role="switch" tabindex="0" aria-checked="false"></div>
                 </div>
-                <div class="at-modal-footer">
-                    <button class="at-modal-btn at-modal-btn-cancel" id="atSettingsCancelBtn">取消</button>
-                    <button class="at-modal-btn at-modal-btn-save" id="atSettingsSaveBtn">保存</button>
+                <div class="at-auto-leave-switch">
+                    <span class="at-auto-leave-switch-label">跳过不说话女生：</span>
+                    <div class="at-silent-controls">
+                        <input id="skipSilentTimeout" class="at-silent-timeout-input" type="number" min="3" max="120" step="1" inputmode="numeric" value="${skipSilentTimeoutSec}" />
+                        <span class="at-silent-unit">秒</span>
+                        <div id="skipSilentToggle" class="at-auto-leave-switch-toggle" role="switch" tabindex="0" aria-checked="false"></div>
+                    </div>
+                </div>
+                <div class="at-auto-leave-switch">
+                    <span class="at-auto-leave-switch-label">重置黑名单：</span>
+                    <button class="at-block-reset-btn" id="atResetBlockBtn">清空（${blockList.length}）</button>
                 </div>
             `;
             mask.appendChild(modal);
             document.body.appendChild(mask);
 
-            // 关闭事件
-            modal.querySelector('.at-modal-close').onclick = () => mask.remove();
-            mask.onclick = e => { if (e.target === mask) mask.remove(); };
-
-            // 取消按钮
-            modal.querySelector('#atSettingsCancelBtn').onclick = () => mask.remove();
-
-            // 保存按钮
-            modal.querySelector('#atSettingsSaveBtn').onclick = function() {
+            // 关闭面板即保存问候语改动（其余设置均为即时生效，无需取消/保存按钮）
+            function saveGreetingsAndClose() {
                 // 收集所有输入框的值
                 const inputs = modal.querySelectorAll('.at-greeting-text');
                 const newList = [];
@@ -1334,7 +1511,11 @@
                     currentGreeting = '';
                 }
                 mask.remove();
-            };
+            }
+
+            // 关闭事件（右上角× / 点击遮罩）
+            modal.querySelector('.at-modal-close').onclick = saveGreetingsAndClose;
+            mask.onclick = e => { if (e.target === mask) saveGreetingsAndClose(); };
 
             // 添加问候语
             modal.querySelector('#atGreetingAddBtn').onclick = function() {
@@ -1403,30 +1584,65 @@
 
             }
 
-            const botToggle = modal.querySelector('#botSkipToggle');
-            if (botToggle) {
-                // 默认开启，仅显式存 false 时关闭
-                try {
-                    const enabled = localStorage.getItem('botSkipEnabled') !== 'false';
-                    botToggle.classList.toggle('active', enabled);
-                    botToggle.setAttribute('aria-checked', enabled ? 'true' : 'false');
-                } catch (e) {
-                    botToggle.classList.add('active');
-                    botToggle.setAttribute('aria-checked', 'true');
-                }
+            const netToggle = modal.querySelector('#netCompatToggle');
+            if (netToggle) {
+                netToggle.classList.toggle('active', netCompatEnabled);
+                netToggle.setAttribute('aria-checked', netCompatEnabled ? 'true' : 'false');
 
-                botToggle.addEventListener('click', function() {
-                    const next = !botToggle.classList.contains('active');
-                    botToggle.classList.toggle('active', next);
-                    botToggle.setAttribute('aria-checked', next ? 'true' : 'false');
+                netToggle.addEventListener('click', function() {
+                    const next = !netToggle.classList.contains('active');
+                    netToggle.classList.toggle('active', next);
+                    netToggle.setAttribute('aria-checked', next ? 'true' : 'false');
                     try {
-                        localStorage.setItem('botSkipEnabled', next ? 'true' : 'false');
-                        botSkipEnabled = next;
-                        console.log('[SSBY] 人机自动跳过开关已切换:', next);
+                        localStorage.setItem('netCompatEnabled', next ? 'true' : 'false');
+                        netCompatEnabled = next;
+                        console.log('[SSBY] 网络不稳定兼容模式已切换:', next);
                     } catch (e) {
-                        console.log('[SSBY] 保存botSkipEnabled失败:', e);
+                        console.log('[SSBY] 保存netCompatEnabled失败:', e);
                     }
+                    showToast(next ? '已开启兼容模式' : '已关闭兼容模式');
                 });
+            }
+
+            const silentToggle = modal.querySelector('#skipSilentToggle');
+            const silentInput = modal.querySelector('#skipSilentTimeout');
+            if (silentToggle) {
+                silentToggle.classList.toggle('active', skipSilentEnabled);
+                silentToggle.setAttribute('aria-checked', skipSilentEnabled ? 'true' : 'false');
+                silentToggle.addEventListener('click', function() {
+                    const next = !silentToggle.classList.contains('active');
+                    silentToggle.classList.toggle('active', next);
+                    silentToggle.setAttribute('aria-checked', next ? 'true' : 'false');
+                    try {
+                        localStorage.setItem('skipSilentEnabled', next ? 'true' : 'false');
+                        skipSilentEnabled = next;
+                        console.log('[SSBY] 跳过不说话女生已切换:', next);
+                    } catch (e) {
+                        console.log('[SSBY] 保存skipSilentEnabled失败:', e);
+                    }
+                    showToast(next ? '已开启：超时无回应将跳过' : '已关闭跳过不说话');
+                    if (!next) clearSilentTimer();
+                });
+            }
+            if (silentInput) {
+                // 失焦或回车即保存，限制在 3~120 秒
+                silentInput.addEventListener('change', function() {
+                    let sec = parseInt(silentInput.value, 10);
+                    if (!(sec >= 3)) sec = 3;
+                    if (sec > 120) sec = 120;
+                    silentInput.value = sec;
+                    skipSilentTimeoutSec = sec;
+                    try { localStorage.setItem('skipSilentTimeout', String(sec)); } catch (e) {}
+                    console.log('[SSBY] 不说话超时时间已保存:', sec, '秒');
+                });
+            }
+
+            const resetBlockBtn = modal.querySelector('#atResetBlockBtn');
+            if (resetBlockBtn) {
+                // 点击后弹二次确认，确认才清空
+                resetBlockBtn.onclick = function () {
+                    showResetBlockConfirm();
+                };
             }
 
         }
@@ -1545,8 +1761,9 @@
                 document.body.appendChild(tip);
                 setTimeout(() => { tip.remove(); }, 1200);
             }
-            modal.querySelector('.at-vip-copy').onclick = copyTQLY;
-            modal.querySelector('.at-vip-modal-title-copy').onclick = copyTQLY;
+            modal.querySelectorAll('.at-vip-copy, .at-vip-modal-title-copy').forEach(function (el) {
+                el.onclick = copyTQLY;
+            });
         }
         vipBtn.onclick = showVipModal;
 
@@ -1601,33 +1818,75 @@
             }
         }
 
-        // 启动变绿计时：优先用接口层记录的配对成功时间校准，接口不可用时退回从当前时刻起算
+        // 启动变绿计时：以当前会话ID的开始时间为准；拿不到会话信息就从此刻起算，绝不沿用旧会话的时长
         function startGreenTimer() {
             if (greenTimer || state === 'green') return;
-            let delay = GREEN_DELAY_MS;
-            const connectedAt = SocketBridge.getConnectedAt ? SocketBridge.getConnectedAt() : 0;
-            if (connectedAt) {
-                delay = Math.max(0, GREEN_DELAY_MS - (Date.now() - connectedAt));
-            }
-            console.log('[SSBY] 启动变绿计时: ' + delay + 'ms 后变绿（接口校正=' + (connectedAt ? '是' : '否') + '）');
+            const session = SocketBridge.getSessionStart ? SocketBridge.getSessionStart() : null;
+            const sessionKey = session ? String(session.chatId || '') : '';
+            const startAt = session && session.at ? session.at : Date.now();
+            const delay = Math.max(0, GREEN_DELAY_MS - (Date.now() - startAt));
+            console.log('[SSBY] 启动变绿计时: ' + delay + 'ms 后变绿（会话=' + (sessionKey || '未知') +
+                '，接口校正=' + (session && session.at ? '是' : '否') + '）');
             greenTimer = setTimeout(function () {
                 greenTimer = null;
+                // 到点时再次核对会话：会话已切换或已结束，本次计时作废
+                const nowSession = SocketBridge.getSessionStart ? SocketBridge.getSessionStart() : null;
+                const nowKey = nowSession ? String(nowSession.chatId || '') : '';
+                if (sessionKey && nowKey && nowKey !== sessionKey) {
+                    console.log('[SSBY] 会话已切换，放弃本次变绿');
+                    return;
+                }
                 state = 'green';
                 updateBreath(state);
             }, delay);
         }
 
+        // 跳过不说话女生：开场白发出后开始计时，对方在超时时间内没说话就离开
+        function startSilentTimer() {
+            clearSilentTimer();
+            if (!skipSilentEnabled) return;
+            if (partnerActivityCount > 0) {
+                console.log('[SSBY] 对方已有反馈，不启动超时跳过');
+                return;
+            }
+            const session = SocketBridge.getSessionStart ? SocketBridge.getSessionStart() : null;
+            const sessionKey = session ? String(session.chatId || '') : '';
+            const timeoutMs = Math.max(3, skipSilentTimeoutSec) * 1000;
+            console.log('[SSBY] 启动不说话超时计时: ' + skipSilentTimeoutSec + 's（会话=' + (sessionKey || '未知') + '）');
+            silentTimer = setTimeout(function () {
+                silentTimer = null;
+                if (!skipSilentEnabled) return;
+                if (partnerActivityCount > 0) {
+                    console.log('[SSBY] 对方已有反馈，取消超时跳过');
+                    return;
+                }
+                // 会话已切换则本次超时作废
+                const nowSession = SocketBridge.getSessionStart ? SocketBridge.getSessionStart() : null;
+                const nowKey = nowSession ? String(nowSession.chatId || '') : '';
+                if (nowKey !== sessionKey) {
+                    console.log('[SSBY] 会话已切换，取消超时跳过');
+                    return;
+                }
+                console.log('[SSBY] 超时内对方未说话，跳过继续刷');
+                leave();
+                loopCount = 0;
+            }, timeoutMs);
+        }
+
+        function clearSilentTimer() {
+            if (silentTimer) {
+                clearTimeout(silentTimer);
+                silentTimer = null;
+            }
+        }
+
         // 打招呼
         function stay() {
             console.log('[SSBY] stay() 函数被调用');
-            if (isTyping) {
-                console.log('[SSBY] 正在输入中，跳过');
-                return;
-            }
 
-            // 打招呼前再拦一次，防止接口帧晚于 DOM 时白发消息
-            if (botSkipEnabled && isBotPartner()) {
-                console.log('[SSBY] 打招呼前命中人机，跳过');
+            // 打招呼前再拦一次，防止接口帧晚于 DOM 时给黑名单用户白发消息
+            if (isPartnerBlocked()) {
+                console.log('[SSBY] 打招呼前命中黑名单，跳过');
                 leave();
                 loopCount = 0;
                 return;
@@ -1660,6 +1919,7 @@
                         console.log('[SSBY] 点击发送按钮');
                         sendBtn.click();
                         lastGreeted = true;
+                        startSilentTimer(); // 开场白已发出，开始"不说话就跳过"计时
                     }
                 }
                 startGreenTimer();
@@ -1668,19 +1928,22 @@
 
         // 重置本轮状态（离开时必须调用，否则问候语会一直沿用第一次随机到的那条）
         function resetRoundState() {
-            lastChatId = null;
+            clearSilentTimer();
             lastGenderInfo = null;
             SocketBridge.consumePartner(); // 清掉接口层缓存的搭档资料，避免下轮误读旧性别重复离开
             lastGreeted = false;
             lastSelfMessageCount = 0;
+            partnerMessageCount = 0; // 新对话从零开始统计对方消息
+            partnerActivityCount = 0; // 新对话从零开始统计对方反馈
+            blockJustNowChatId = null; // 会话已结束，之后遇到黑名单用户正常跳过
             currentGreeting = ''; // 重置问候语，下次打招呼重新随机选一条
         }
 
         // 离开
         function leave() {
             console.log('[SSBY] leave() 函数被调用');
-            // 优先用接口结束并重新匹配
-            if (SocketBridge.isActive()) {
+            // 兼容模式开启时只用 DOM 切换；否则优先用接口结束并重新匹配
+            if (!netCompatEnabled && SocketBridge.isActive()) {
                 const p = SocketBridge.takePartner();
                 const chatId = p ? p.chatId : null;
                 if (chatId && SocketBridge.endAndRematch()) {
@@ -1722,19 +1985,108 @@
             }
         }
 
-        // 人机判定：wordFilter=0 且（标签仅"清流"一条，或 extra 带 isWeixin 键）
-        // 取不到接口数据时返回 false，宁可放过也不误杀
-        function isBotPartner() {
-            const profile = SocketBridge.getPartnerProfile();
-            if (!profile) return false;
-
-            const labels = Array.isArray(profile.labels) ? profile.labels : [];
-            const onlyQingliu = labels.length === 1 && String(labels[0] && labels[0].name) === '清流';
-            const bot = profile.wordFilter === 0 && (onlyQingliu || profile.hasWeixinKey === true);
-            if (bot) {
-                console.log('[SSBY] 命中人机特征:', JSON.stringify(profile));
+        // 站点"连接已断开"弹框是否可见
+        function isDisconnectedPopupVisible() {
+            const dialogs = document.querySelectorAll('.custom-popup-dialog');
+            for (let i = 0; i < dialogs.length; i++) {
+                const el = dialogs[i];
+                if (!el.textContent || el.textContent.indexOf('连接已断开') < 0) continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) return true;
             }
-            return bot;
+            return false;
+        }
+
+        // 一键开启兼容模式（与设置里的开关共用同一状态）
+        function enableNetCompat() {
+            netCompatEnabled = true;
+            try { localStorage.setItem('netCompatEnabled', 'true'); } catch (e) {}
+            const t = document.querySelector('#netCompatToggle');
+            if (t) {
+                t.classList.add('active');
+                t.setAttribute('aria-checked', 'true');
+            }
+            console.log('[SSBY] 已通过断连提示开启兼容模式');
+            showToast('已开启兼容模式');
+        }
+
+        // 检测到断连弹框时，引导用户开启兼容模式
+        function showDisconnectTip() {
+            if (document.querySelector('.at-disconnect-tip-mask')) return;
+            const mask = document.createElement('div');
+            mask.className = 'at-confirm-mask at-disconnect-tip-mask';
+            const modal = document.createElement('div');
+            modal.className = 'at-modal';
+            modal.innerHTML = `
+                <div class="at-modal-title">检测到连接断开</div>
+                <div class="at-modal-content">可能是网络不稳定或浏览器多开导致。开启「网络不稳定兼容模式」后，脚本会改用页面点击方式切换，可明显减少断连。<br><br>也可以先点页面上的「确认」恢复后再决定。</div>
+                <div class="at-modal-footer">
+                    <button class="at-modal-btn at-modal-btn-cancel" id="atDisconnectLaterBtn">稍后</button>
+                    <button class="at-modal-btn at-modal-btn-primary" id="atDisconnectEnableBtn">开启兼容模式</button>
+                </div>
+            `;
+            mask.appendChild(modal);
+            document.body.appendChild(mask);
+            mask.onclick = function (e) { if (e.target === mask) mask.remove(); };
+            modal.querySelector('#atDisconnectLaterBtn').onclick = function () { mask.remove(); };
+            modal.querySelector('#atDisconnectEnableBtn').onclick = function () {
+                enableNetCompat();
+                mask.remove();
+            };
+        }
+
+        // 读取当前对方ID：只认 WS 帧里的 partnerIdEncrypted（chatId 是随机会话号，不能当身份用）
+        function getCurrentPartnerId() {
+            const uid = SocketBridge.getPartnerUserId ? SocketBridge.getPartnerUserId() : '';
+            return uid ? String(uid) : null;
+        }
+
+        // 当前对方是否已被拉黑（刚手动拉黑的当前会话先放行，避免把正在看的人立即踢掉）
+        function isPartnerBlocked() {
+            const id = getCurrentPartnerId();
+            if (!id) return false;
+            if (id === blockJustNowChatId) return false;
+            return blockList.indexOf(id) >= 0;
+        }
+
+        function saveBlockList() {
+            try {
+                localStorage.setItem(BLOCK_LIST_KEY, JSON.stringify(blockList));
+            } catch (e) {
+                console.log('[SSBY] 保存黑名单失败:', e);
+            }
+        }
+
+        // 拉黑 / 取消拉黑当前对方
+        function togglePartnerBlock() {
+            const id = getCurrentPartnerId();
+            if (!id) {
+                showToast('未检测到对方ID，无法拉黑');
+                return;
+            }
+            const idx = blockList.indexOf(id);
+            if (idx >= 0) {
+                blockList.splice(idx, 1);
+                if (blockJustNowChatId === id) blockJustNowChatId = null;
+                saveBlockList();
+                console.log('[SSBY] 已取消拉黑:', id);
+                showToast('已取消拉黑');
+            } else {
+                blockList.push(id);
+                blockJustNowChatId = id; // 当前会话暂不跳过，等本轮结束再遇到才生效
+                saveBlockList();
+                console.log('[SSBY] 已拉黑:', id);
+                showToast('已拉黑该用户');
+            }
+            updateBlockBtnState();
+        }
+
+        // 同步拉黑按钮的视觉状态（红色 = 当前对方已在黑名单）
+        function updateBlockBtnState() {
+            const id = getCurrentPartnerId();
+            const blocked = !!id && blockList.indexOf(id) >= 0;
+            blockBtn.classList.toggle('blocked', blocked);
+            blockBtn.title = blocked ? '取消拉黑' : '拉黑对方';
         }
 
         // 自动聊天逻辑（性能优化版）
@@ -1742,6 +2094,24 @@
             loopCount++;
             console.log('[SSBY] ========== autoChatLoop() 开始 (第', loopCount, '次) ==========');
             console.log('[SSBY] 状态: 接口加速=' + (SocketBridge.isActive() ? '启用' : '未启用'));
+
+            // 检测站点"连接已断开"弹框：出现且未开兼容模式时，引导用户开启
+            const disconnected = isDisconnectedPopupVisible();
+            if (!disconnected) {
+                disconnectTipShown = false; // 弹框已消失，下次再出现可再次提示
+            } else if (!netCompatEnabled && !disconnectTipShown) {
+                disconnectTipShown = true;
+                showDisconnectTip();
+            }
+
+            // 命中黑名单：直接跳过继续刷（刚手动拉黑的当前会话除外）
+            if (isPartnerBlocked()) {
+                console.log('[SSBY] 命中黑名单，跳过继续刷:', getCurrentPartnerId());
+                leave();
+                loopCount = 0;
+                console.log('[SSBY] ========== autoChatLoop() 结束 ==========');
+                return;
+            }
 
             // 获取性别信息（带缓存）
             const genderInfo = getGenderInfo();
@@ -1759,11 +2129,6 @@
                     } else {
                         console.log('[SSBY] 女生离开，但开关未开启，不执行离开');
                     }
-                } else if (botSkipEnabled && isBotPartner()) {
-                    // 命中人机，即便是女生也跳过继续刷
-                    console.log('[SSBY] 检测到人机，跳过继续刷');
-                    leave();
-                    loopCount = 0;
                 } else {
                     // 检查是否已经打过招呼
                     const currentGreeted = hasSentMessage();
@@ -1776,8 +2141,14 @@
 
                     if (currentGreeted) {
                         console.log('[SSBY] 已经打过招呼，跳过');
-                        // 如果已经打招呼，降低循环频率
-                        adjustLoopSpeed(true);
+                        // 只有对方真正聊了两句以上才降频；否则保持快速，方便对方秒退后立刻重刷
+                        if (partnerMessageCount >= PARTNER_REPLY_THRESHOLD) {
+                            console.log('[SSBY] 对方已回复', partnerMessageCount, '条，降低循环频率');
+                            adjustLoopSpeed(true);
+                        } else {
+                            console.log('[SSBY] 对方仅回复', partnerMessageCount, '条，保持快速循环');
+                            adjustLoopSpeed(false);
+                        }
                     } else {
                         console.log('[SSBY] 留下并打招呼');
                         stay();
@@ -1860,9 +2231,7 @@
                     }
                 }
             }
-            clickLeaveButton()
-
-            return false;
+            return clickLeaveButton();
         }
 
 // 点击离开按钮（聊天界面中的"离开"按钮）
@@ -1902,42 +2271,6 @@
             return false;
         }
 
-
-        // 判断是否已经打过招呼（localStorage标记 + DOM检测）
-        function hasGreeted() {
-            const chatStateKey = 'bottle_chat_state';
-            let chatId = null;
-            try {
-                const stateData = localStorage.getItem(chatStateKey);
-                if (stateData) {
-                    const chatState = JSON.parse(stateData);
-                    chatId = chatState?.chatId || null;
-                    console.log('[SSBY] 当前chatId:', chatId);
-                    if (chatId) {
-                        const greetedKey = `bottle_chat_${chatId}`;
-                        const hasGreeted = localStorage.getItem(greetedKey) === 'true';
-                        console.log('[SSBY] localStorage标记已打招呼:', hasGreeted);
-                        if (hasGreeted) {
-                            return true;
-                        }
-                    }
-                }
-            } catch (e) {
-                console.log('[SSBY] 解析chatState失败:', e);
-            }
-            
-            // 方法2：通过DOM检测
-            if (hasSentMessage()) {
-                console.log('[SSBY] DOM检测已说过话，更新localStorage标记');
-                // 同时更新localStorage标记
-                if (chatId) {
-                    localStorage.setItem(`bottle_chat_${chatId}`, 'true');
-                }
-                return true;
-            }
-            
-            return false;
-        }
 
         // 获取性别信息（带缓存）
         function getGenderInfo() {
@@ -2017,6 +2350,7 @@
         let dragStarted = false;
         let dragStartX = 0, dragStartY = 0;
         let rootStartX = 0, rootStartY = 0;
+        let lastTouchTs = 0; // 最近一次触摸时间，用于忽略触摸后浏览器补发的合成鼠标事件
         const DRAG_THRESHOLD = 5; // 超过5px才算拖动
 
         // 不恢复保存的位置，每次都使用CSS定义的固定初始位置（仍可拖动移动）
@@ -2100,6 +2434,7 @@
                     updatePanelDirection();
                     isOpen = !isOpen;
                     root.classList.toggle('open', isOpen);
+                    if (isOpen) updateBlockBtnState(); // 打开菜单时同步拉黑按钮状态
                 }
                 singleClickCount = 0;
                 if (singleClickTimer) { clearTimeout(singleClickTimer); singleClickTimer = null; }
@@ -2124,8 +2459,56 @@
             }, 2000);
         }
 
+        // 通用轻提示（复用双击提示的样式，保证反馈风格统一）
+        function showToast(text) {
+            const old = document.querySelector('.at-double-click-tip');
+            if (old) old.remove();
+            const tip = document.createElement('div');
+            tip.className = 'at-double-click-tip';
+            tip.textContent = text;
+            document.body.appendChild(tip);
+            requestAnimationFrame(() => { tip.classList.add('show'); });
+            setTimeout(() => {
+                tip.classList.remove('show');
+                setTimeout(() => { tip.remove(); }, 300);
+            }, 1800);
+        }
+
+        // 重置黑名单的二次确认弹框
+        function showResetBlockConfirm() {
+            if (document.querySelector('.at-confirm-mask')) return;
+            const mask = document.createElement('div');
+            mask.className = 'at-confirm-mask';
+            const modal = document.createElement('div');
+            modal.className = 'at-modal';
+            modal.innerHTML = `
+                <div class="at-modal-title">重置黑名单</div>
+                <div class="at-modal-content">确定要清空黑名单吗？清空后，已拉黑的用户将不再被自动跳过。</div>
+                <div class="at-modal-footer">
+                    <button class="at-modal-btn at-modal-btn-cancel" id="atConfirmCancelBtn">取消</button>
+                    <button class="at-modal-btn at-modal-btn-danger" id="atConfirmOkBtn">确认清空</button>
+                </div>
+            `;
+            mask.appendChild(modal);
+            document.body.appendChild(mask);
+            mask.onclick = function (e) { if (e.target === mask) mask.remove(); };
+            modal.querySelector('#atConfirmCancelBtn').onclick = function () { mask.remove(); };
+            modal.querySelector('#atConfirmOkBtn').onclick = function () {
+                blockList = [];
+                saveBlockList();
+                mask.remove();
+                // 设置弹框仍开着，同步按钮上的数量
+                const btn = document.querySelector('#atResetBlockBtn');
+                if (btn) btn.textContent = '清空（0）';
+                console.log('[SSBY] 黑名单已清空');
+                showToast('黑名单已清空');
+            };
+        }
+
         // 鼠标事件
         mainBtn.addEventListener('mousedown', function(e) {
+            // 触摸后浏览器补发的合成鼠标事件，忽略，避免单击被重复计数成"双击"
+            if (Date.now() - lastTouchTs < 600) return;
             e.preventDefault();
             onDragStart(e.clientX, e.clientY);
         });
@@ -2136,11 +2519,14 @@
             }
         });
         document.addEventListener('mouseup', function() {
+            // 触摸后浏览器补发的合成鼠标事件，忽略
+            if (Date.now() - lastTouchTs < 600) return;
             onDragEnd();
         });
 
         // 触摸事件
         mainBtn.addEventListener('touchstart', function(e) {
+            lastTouchTs = Date.now();
             if (e.touches.length === 1) {
                 const t = e.touches[0];
                 onDragStart(t.clientX, t.clientY);
@@ -2156,6 +2542,7 @@
             }
         }, { passive: false });
         document.addEventListener('touchend', function() {
+            lastTouchTs = Date.now();
             onDragEnd();
         });
 
@@ -2163,12 +2550,30 @@
         panel.appendChild(switchBtn);
         panel.appendChild(settingBtn);
         panel.appendChild(vipBtn);
+        panel.appendChild(blockBtn);
+        blockBtn.onclick = togglePartnerBlock;
         root.appendChild(mainBtn);
         root.appendChild(panel);
         document.body.appendChild(root);
         SocketBridge.bind({
             isOn: function () { return isOn; },
-            fallbackLeave: domLeave
+            fallbackLeave: domLeave,
+            // 累计对方发来的消息条数，用于判断是否已聊够两句再降频
+            // 只有当前会话已建立（收到 connected）才统计对方行为，避免匹配期间的服务端事件污染计数
+            onPartnerMessage: function () {
+                if (!SocketBridge.getSessionStart || !SocketBridge.getSessionStart()) return;
+                partnerMessageCount++;
+                console.log('[SSBY] 对方消息计数:', partnerMessageCount);
+            },
+            // 对方任意反馈（除心跳）都算有回应，取消超时跳过
+            onPartnerActivity: function (event) {
+                if (!SocketBridge.getSessionStart || !SocketBridge.getSessionStart()) return;
+                partnerActivityCount++;
+                if (silentTimer) {
+                    console.log('[SSBY] 对方有反馈（' + event + '），取消超时跳过');
+                }
+                clearSilentTimer();
+            }
         });
         // 初始化呼吸光
         updateBreath(state);

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         桃趣乐友叔叔不约小助手
 // @namespace    https://www.shushubuyue.net/
-// @version      2.9
+// @version      2.10
 // @description  桃趣乐友叔叔不约小助手，关注“桃趣乐友”公众号享受最新版本。
 // @author       桃趣乐友
 // @match        *://shushubuyue.net/*
@@ -1043,6 +1043,10 @@
             flex-direction: column;
             gap: 8px;
             margin-bottom: 8px;
+            max-height: 200px;         /* 问候语多了也只占这么高，内部滚动 */
+            overflow-y: auto;
+            padding-right: 2px;
+            -webkit-overflow-scrolling: touch;
         }
         .at-greeting-item {
             display: flex;

@@ -2095,13 +2095,15 @@
             console.log('[SSBY] ========== autoChatLoop() 开始 (第', loopCount, '次) ==========');
             console.log('[SSBY] 状态: 接口加速=' + (SocketBridge.isActive() ? '启用' : '未启用'));
 
-            // 检测站点"连接已断开"弹框：出现且未开兼容模式时，引导用户开启
-            const disconnected = isDisconnectedPopupVisible();
-            if (!disconnected) {
-                disconnectTipShown = false; // 弹框已消失，下次再出现可再次提示
-            } else if (!netCompatEnabled && !disconnectTipShown) {
-                disconnectTipShown = true;
-                showDisconnectTip();
+            // 检测站点"连接已断开"弹框：已是兼容模式则完全不检测、不提示
+            if (!netCompatEnabled) {
+                const disconnected = isDisconnectedPopupVisible();
+                if (!disconnected) {
+                    disconnectTipShown = false; // 弹框已消失，下次再出现可再次提示
+                } else if (!disconnectTipShown) {
+                    disconnectTipShown = true;
+                    showDisconnectTip();
+                }
             }
 
             // 命中黑名单：直接跳过继续刷（刚手动拉黑的当前会话除外）
